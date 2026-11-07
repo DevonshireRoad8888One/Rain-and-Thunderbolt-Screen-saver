@@ -1,0 +1,523 @@
+
+                        <!DOCTYPE html>
+                        <html lang="en">
+                        <head>
+                            <meta charset="UTF-8">
+                            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+							<style>
+								body {
+									background-color: white; /* Ensure the iframe has a white background */
+								}
+
+								
+							</style>
+                        </head>
+                        <body>
+                            <!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+<title>Rain Glass — screensaver</title>
+<style>
+  html,body{margin:0;height:100%;background:#0d1424;overflow:hidden;cursor:none}
+  canvas{display:block;position:fixed;inset:0;width:100%;height:100%}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(() => {
+'use strict';
+
+/* Rain Glass — screensaver edition.
+   Chrome-free build of the Rain on Glass page: no panel, no sliders.
+   The scene drifts day -> dusk -> night -> forest on a slow cross-fade,
+   storm mode adds gusting wind, forked lightning and synthesized thunder. */
+
+const TAU = Math.PI*2;
+const clamp = (v,a,b)=> v<a ? a : (v>b ? b : v);
+const rand  = (a,b)=> a + Math.random()*(b-a);
+const MARGIN = 200;
+
+const qs = new URLSearchParams(location.search);
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d',{alpha:false});
+const mk = () => { const c = document.createElement('canvas'); return {c, x:c.getContext('2d')}; };
+const sc = mk();   // raw painted scene
+const pA = mk();   // plate A (current)
+const pB = mk();   // plate B (incoming)
+const bg = mk();   // live background: plate + streaks, sampled for refraction
+const st = mk();   // streak layer
+
+const P = {
+  density : 1.25, size : 1.5, speed : 1.05, blur : 8, exposure : 1.08,
+  wind    : 0.1,  gust : 0.9,  volume : 0.75,
+  storm   : false, lightning : true, thunder : true, rainSnd : true,
+  cycle   : true
+};
+
+['density','size','speed','blur','exposure','wind','gust','volume'].forEach(k=>{
+  if(qs.has(k)) P[k] = parseFloat(qs.get(k));
+});
+if(qs.has('storm'))      P.storm      = qs.get('storm')==='1';
+if(qs.has('lightning'))  P.lightning  = qs.get('lightning')==='1';
+if(qs.has('thunder'))    P.thunder    = qs.get('thunder')==='1';
+if(qs.has('rain'))       P.rainSnd    = qs.get('rain')==='1';
+if(qs.has('cycle'))      P.cycle      = qs.get('cycle')==='1';
+
+const CYCLE = ['day','dusk','night','forest'];
+const PAL = {
+  day:     {sky:['#6fb0e4','#a8d2ef','#d9e8f2','#f3e2c8'],
+            glow:[{x:.72,y:.20,r:.42,c:'rgba(255,247,214,.85)'},{x:.24,y:.32,r:.55,c:'rgba(255,255,255,.40)'}],
+            sil:'cityDay', bokeh:['#ffffff','#ffeec6','#d4e7ff'], luma:.80},
+  dusk:    {sky:['#2b2a58','#5f4a78','#a97185','#efb884'],
+            glow:[{x:.52,y:.76,r:.62,c:'rgba(255,190,135,.45)'},{x:.16,y:.20,r:.50,c:'rgba(140,155,235,.25)'}],
+            sil:'hills', bokeh:['#ffd7a8','#ffb0a0','#c6d4ff'], luma:.42},
+  night:   {sky:['#0d1428','#16203a','#243050'],
+            glow:[{x:.24,y:.28,r:.55,c:'rgba(80,130,225,.30)'},{x:.80,y:.14,r:.45,c:'rgba(240,140,80,.20)'},{x:.50,y:.90,r:.65,c:'rgba(40,80,150,.30)'}],
+            sil:'city', bokeh:['#ffd39a','#ffb26e','#a8dcff','#ff8f6e'], luma:.20},
+  forest:  {sky:['#06170f','#0b2a1e','#164634'],
+            glow:[{x:.30,y:.08,r:.62,c:'rgba(130,235,180,.26)'},{x:.78,y:.42,r:.50,c:'rgba(245,235,170,.18)'}],
+            sil:'trees', bokeh:['#c8f7d8','#f2eaae'], luma:.22},
+  storm:   {sky:['#141a22','#232c38','#39434f'],
+            glow:[{x:.50,y:.15,r:.70,c:'rgba(140,165,195,.28)'}],
+            sil:'city', bokeh:['#cfe0ef','#9fb6c8','#e8d9a0'], luma:.26},
+  overcast:{sky:['#6b7784','#8f9aa6','#b3bbc4','#c9ced3'],
+            glow:[{x:.50,y:.20,r:.65,c:'rgba(220,228,238,.45)'}],
+            sil:'cityDay', bokeh:['#e8eef5','#c8d4e0','#f0e2c8'], luma:.62}
+};
+
+let W=0,H=0,SW=0,DPR=1,T=0,last=performance.now();
+let sceneName = PAL[qs.get('palette')] ? qs.get('palette') : 'day';
+if(PAL[qs.get('palette')]) P.cycle = false;      // an explicit palette locks the scene
+let fade=1, fading=false, nextSceneAt=110;
+let drops=[], residue=[], ripples=[], streaks=[], bolts=[], sounds=[];
+let windNow=0, camX=0, gustPhase=rand(0,100), flash=0, boost=0, nextStrike=6;
+let paused=false, quality=1;
+
+/* ------------------------------------------------------------------ audio */
+let ac=null, bed=null;
+function audio(){
+  try{
+    if(!ac){ const A=window.AudioContext||window.webkitAudioContext; if(!A) return null; ac=new A(); }
+    if(ac.state==='suspended') ac.resume();
+    return ac;
+  }catch(e){ return null; }
+}
+function noise(sec){
+  const n=Math.ceil(ac.sampleRate*sec), b=ac.createBuffer(1,n,ac.sampleRate), d=b.getChannelData(0);
+  for(let i=0;i<n;i++) d[i]=Math.random()*2-1;
+  return b;
+}
+function startBed(){
+  const a=audio(); if(!a) return;
+  if(bed){ try{ bed.g.gain.setTargetAtTime(P.volume*0.15, a.currentTime, .5); }catch(e){} return; }
+  const s=a.createBufferSource(); s.buffer=noise(4); s.loop=true;
+  const hp=a.createBiquadFilter(); hp.type='highpass'; hp.frequency.value=420;
+  const lp=a.createBiquadFilter(); lp.type='lowpass'; lp.frequency.value=7000;
+  const g=a.createGain(); g.gain.value=.0001;
+  s.connect(hp); hp.connect(lp); lp.connect(g); g.connect(a.destination);
+  s.start(); bed={s,g};
+  g.gain.setTargetAtTime(P.volume*0.15, a.currentTime, .8);
+}
+function thunder(dist,power){
+  const a=audio(); if(!a || !P.thunder) return;
+  const dur=2.4+dist*5.5;
+  const s=a.createBufferSource(); s.buffer=noise(dur+.4);
+  const lp=a.createBiquadFilter(); lp.type='lowpass'; lp.Q.value=.8;
+  lp.frequency.setValueAtTime(Math.max(120,1400-dist*1100), a.currentTime);
+  lp.frequency.exponentialRampToValueAtTime(90, a.currentTime+dur);
+  const g=a.createGain();
+  const N=220, cv2=new Float32Array(N), crack=Math.max(0,1-dist*1.5);
+  for(let i=0;i<N;i++){
+    const t=i/N;
+    let v=.10*power*Math.pow(1-t,1.6) + crack*.75*Math.exp(-t*22);
+    v *= 1 + .9*Math.sin(t*44+dist*9)*Math.sin(t*17+1.3);
+    cv2[i]=Math.max(.0001,v);
+  }
+  g.gain.setValueCurveAtTime(cv2, a.currentTime, dur);
+  const out=a.createGain(); out.gain.value=P.volume;
+  s.connect(lp); lp.connect(g); g.connect(out); out.connect(a.destination);
+  s.start(); s.stop(a.currentTime+dur+.2);
+}
+
+/* ------------------------------------------------------------------ scene */
+function paint(){
+  const p=PAL[sceneName];
+  sc.x.setTransform(DPR,0,0,DPR,0,0);
+  sc.x.clearRect(0,0,SW,H);
+  const g=sc.x.createLinearGradient(0,0,0,H);
+  p.sky.forEach((c,i)=>g.addColorStop(i/(p.sky.length-1),c));
+  sc.x.fillStyle=g; sc.x.fillRect(0,0,SW,H);
+  for(const gl of p.glow){
+    const r=Math.max(1,gl.r*Math.max(SW,H));
+    const gg=sc.x.createRadialGradient(gl.x*SW,gl.y*H,0,gl.x*SW,gl.y*H,r);
+    gg.addColorStop(0,gl.c); gg.addColorStop(1,'rgba(0,0,0,0)');
+    sc.x.fillStyle=gg; sc.x.fillRect(0,0,SW,H);
+  }
+  if(p.sil==='city') city(false);
+  else if(p.sil==='cityDay') city(true);
+  else if(p.sil==='hills') hills(false);
+  else if(p.sil==='trees') trees();
+  if(p.luma>.55) clouds();
+  bokeh(p.bokeh);
+}
+function city(day){
+  const x=sc.x, base=H*.99;
+  x.fillStyle = day ? 'rgba(126,142,160,.80)' : 'rgba(7,11,20,.90)';
+  let px=-60;
+  while(px<SW+60){
+    const bw=rand(46,120), bh=rand(H*.16,H*.52);
+    x.fillRect(px,base-bh,bw,bh);
+    const cols=Math.max(1,Math.floor(bw/14)), rows=Math.max(1,Math.floor(bh/19));
+    for(let i=0;i<cols;i++) for(let j=0;j<rows;j++) if(Math.random()<(day?.28:.18)){
+      x.fillStyle = day ? (Math.random()<.5?'rgba(255,252,238,.75)':'rgba(180,205,232,.65)')
+                       : (Math.random()<.7?'rgba(255,205,130,.9)':'rgba(150,215,255,.8)');
+      x.fillRect(px+6+i*14, base-bh+8+j*19, 5, 7);
+      x.fillStyle = day ? 'rgba(126,142,160,.80)' : 'rgba(7,11,20,.90)';
+    }
+    px += bw + rand(4,18);
+  }
+  const hz=x.createLinearGradient(0,H*.62,0,H);
+  hz.addColorStop(0,'rgba(255,255,255,0)');
+  hz.addColorStop(1, day?'rgba(255,255,255,.45)':'rgba(60,95,150,.28)');
+  x.fillStyle=hz; x.fillRect(0,H*.62,SW,H*.38);
+}
+function hills(day){
+  const x=sc.x, L=day?4:3;
+  for(let l=0;l<L;l++){
+    const amp=H*(.045+l*.028), yy=H*(.58+l*.085);
+    if(day) x.fillStyle=['#8fb573','#79a765','#5f9357','#4a7d4c'][l%4];
+    else x.fillStyle='rgba(34,26,48,'+(.55+l*.15)+')';
+    x.beginPath(); x.moveTo(0,H);
+    for(let px=0;px<=SW;px+=22)
+      x.lineTo(px, yy+Math.sin(px*.004+l*2.1)*amp+Math.sin(px*.011+l)*amp*.35);
+    x.lineTo(SW,H); x.closePath(); x.fill();
+  }
+}
+function trees(){
+  const x=sc.x;
+  for(let i=0;i<11;i++){
+    const tx=rand(-40,SW+40), tw=rand(9,28), top=rand(H*.05,H*.5);
+    const g=x.createLinearGradient(tx,top,tx,H);
+    g.addColorStop(0,'rgba(8,32,24,.88)'); g.addColorStop(1,'rgba(3,14,11,.97)');
+    x.fillStyle=g;
+    x.beginPath();
+    x.moveTo(tx-tw,H); x.lineTo(tx-tw*.35,top); x.lineTo(tx+tw*.35,top); x.lineTo(tx+tw,H);
+    x.closePath(); x.fill();
+  }
+}
+function clouds(){
+  const x=sc.x;
+  for(let i=0;i<10;i++){
+    const cx=rand(0,SW), cy=rand(H*.04,H*.40), cr=rand(70,190);
+    const g=x.createRadialGradient(cx,cy,0,cx,cy,cr);
+    g.addColorStop(0,'rgba(255,255,255,.60)');
+    g.addColorStop(.55,'rgba(255,255,255,.22)');
+    g.addColorStop(1,'rgba(255,255,255,0)');
+    x.fillStyle=g; x.fillRect(cx-cr,cy-cr,cr*2,cr*2);
+  }
+}
+function bokeh(colors){
+  const x=sc.x, n=Math.round(24*clamp(SW/1200,.6,2));
+  for(let i=0;i<n;i++){
+    const bx=rand(0,SW), by=rand(H*.12,H), br=rand(10,62);
+    const c=colors[(Math.random()*colors.length)|0];
+    const g=x.createRadialGradient(bx,by,0,bx,by,br);
+    g.addColorStop(0,c+'bb'); g.addColorStop(.45,c+'3a'); g.addColorStop(1,'rgba(0,0,0,0)');
+    x.fillStyle=g; x.beginPath(); x.arc(bx,by,br,0,TAU); x.fill();
+  }
+}
+function plate(target){
+  paint();
+  target.x.setTransform(DPR,0,0,DPR,0,0);
+  target.x.clearRect(0,0,SW,H);
+  target.x.filter='blur('+P.blur+'px)';
+  target.x.drawImage(sc.c,0,0,SW,H);
+  target.x.filter='none';
+}
+function copyPlate(){
+  pA.x.setTransform(DPR,0,0,DPR,0,0);
+  pA.x.clearRect(0,0,SW,H);
+  pA.x.drawImage(pB.c,0,0,SW,H);
+}
+
+/* ------------------------------------------------------------------ drops */
+function newDrop(x,y,r){ return {x,y,r,vx:0,vy:0,moving:false,phase:rand(0,TAU),trail:0,dead:false}; }
+function spawn(){
+  const q=Math.random();
+  const r = q<.58 ? rand(.9,2.2) : q<.90 ? rand(2.2,4.4) : rand(4.4,8.4);
+  drops.push(newDrop(rand(0,W), rand(0,H), r*P.size*.8));
+}
+function strike(){
+  const pts=[], x0=rand(W*.08,W*.92), y0=rand(-H*.05,H*.12);
+  let cx=x0, cy=y0;
+  const segs=9+(Math.random()*8|0), total=H*(.5+Math.random()*.5);
+  pts.push({x:cx,y:cy});
+  for(let i=0;i<segs;i++){
+    const stp=total/segs;
+    cx += (Math.random()-.5)*stp*.85 + windNow*10; cy += stp;
+    pts.push({x:cx,y:cy});
+  }
+  const br=[];
+  for(let b=0;b<2+(Math.random()*3|0);b++){
+    const i=1+(Math.random()*(pts.length-2)|0), p0=pts[i];
+    let bx=p0.x, by=p0.y; const bp=[{x:bx,y:by}];
+    for(let j=0;j<3+(Math.random()*3|0);j++){ bx+=(Math.random()-.5)*70; by+=28+Math.random()*60; bp.push({x:bx,y:by}); }
+    br.push(bp);
+  }
+  return {pts,br,life:0,dur:.26+Math.random()*.22};
+}
+function boltPath(b){
+  const a=1-b.life/b.dur, flick=.55+.45*Math.abs(Math.sin(b.life*47));
+  ctx.save(); ctx.globalCompositeOperation='lighter';
+  const line=(pts,w,al)=>{
+    ctx.beginPath(); ctx.moveTo(pts[0].x,pts[0].y);
+    for(let i=1;i<pts.length;i++) ctx.lineTo(pts[i].x,pts[i].y);
+    ctx.lineWidth=w; ctx.strokeStyle='rgba(190,215,255,'+(al*flick).toFixed(3)+')';
+    ctx.lineJoin='round'; ctx.lineCap='round'; ctx.stroke();
+  };
+  for(const br of b.br) line(br,3,.28*a);
+  line(b.pts,9,.16*a); line(b.pts,4,.42*a); line(b.pts,1.6,.95*a);
+  ctx.restore();
+}
+
+/* ----------------------------------------------------------------- update */
+function update(dt){
+  T += dt;
+
+  // gusts
+  const g=Math.sin(T*.17+gustPhase)*.55 + Math.sin(T*.41+gustPhase*1.7)*.30
+        + Math.sin(T*.93+2.1)*.15 + Math.sin(T*2.3+gustPhase*.6)*.07;
+  const target = P.wind + (P.storm ? P.gust*g : 0);
+  windNow += (target-windNow)*Math.min(1,dt*1.1);
+  camX += (clamp(-windNow*55,-MARGIN/2,MARGIN/2)-camX)*Math.min(1,dt*.8);
+
+  // lightning
+  if(P.lightning){
+    nextStrike -= dt;
+    if(nextStrike<=0){
+      nextStrike = rand(3.5,12)/(P.storm?1:2.4);
+      const dist=rand(.04,1);
+      bolts.push(strike());
+      flash=1; boost=.9-dist*.5;
+      sounds.push({at:T+dist*6.5,dist,power:1-dist*.45});
+      if(Math.random()<.35){ bolts.push(strike()); flash=1; }
+    }
+  }
+  for(const b of bolts) b.life+=dt;
+  bolts=bolts.filter(b=>b.life<b.dur);
+  if(flash>0) flash=Math.max(0,flash-dt*2.6);
+  if(boost>0) boost=Math.max(0,boost-dt*1.8);
+  for(let i=sounds.length-1;i>=0;i--) if(T>=sounds[i].at){ thunder(sounds[i].dist,sounds[i].power); sounds.splice(i,1); }
+
+  // scene drift
+  if(P.cycle && !fading){
+    nextSceneAt -= dt;
+    if(nextSceneAt<=0){
+      sceneName = CYCLE[(CYCLE.indexOf(sceneName)+1)%CYCLE.length];
+      plate(pB); fade=0; fading=true; nextSceneAt=110+rand(0,40);
+    }
+  }
+  if(fading){
+    fade += dt/2.6;
+    if(fade>=1){ copyPlate(); fading=false; fade=1; }
+  }
+
+  // drops
+  const want=Math.round(155*P.density*quality);
+  if(drops.length+residue.length<want && Math.random()<.6) spawn();
+  for(const d of drops){
+    if(d.dead) continue;
+    if(!d.moving){
+      d.r += (.34+Math.random()*.6)*dt*P.size;
+      if(d.r>6.2*P.size && Math.random()<.30){ d.moving=true; d.vy=rand(18,62); }
+      if(d.r<1.05 && Math.random()<.008) d.dead=true;
+    } else {
+      d.vy=Math.min(d.vy+270*P.speed*dt,1500);
+      d.vx+=windNow*160*dt; d.vx*=.994; d.vy*=.999;
+      d.y+=d.vy*dt; d.x+=(d.vx+Math.sin(d.y*.03+d.phase)*16)*dt;
+      d.trail+=dt;
+      while(d.trail>.022){
+        d.trail-=.022;
+        if(residue.length<1100) residue.push({x:d.x-d.r*.42+rand(-1.5,1.5), y:d.y+rand(0,5), r:rand(.5,1.7)});
+      }
+      if(d.y > H-sill()-2 && d.vy>0){
+        ripples.push({x:d.x,t:0,max:rand(60,165)});
+        d.dead=true;
+      }
+    }
+    if(d.x<-60||d.x>W+60) d.dead=true;
+  }
+  drops=drops.filter(d=>!d.dead);
+  residue=residue.filter(r=>!r.dead);
+  for(const r of ripples) r.t+=dt*.85;
+  ripples=ripples.filter(r=>r.t<1);
+
+  // streaks behind the glass
+  if(!streaks.length){
+    for(let i=0;i<Math.round(175*clamp(P.density,.3,2.4));i++)
+      streaks.push({x:rand(-MARGIN,SW+MARGIN),y:rand(0,H),len:rand(18,86),spd:rand(320,1050),a:rand(.06,.26)});
+  }
+  const sx=st.x;
+  sx.setTransform(DPR,0,0,DPR,0,0); sx.clearRect(0,0,W,H); sx.lineCap='round';
+  const slant=clamp(windNow,-1.6,1.6)*.75, heavy=P.storm?1:.72;
+  for(const s of streaks){
+    s.y+=s.spd*dt*(.55+P.speed*.55)*heavy; s.x+=windNow*220*dt;
+    if(s.y>H+s.len){ s.y=-s.len; s.x=rand(-MARGIN,SW+MARGIN); }
+    if(s.x<-MARGIN-80) s.x=SW+MARGIN; else if(s.x>SW+MARGIN+80) s.x=-MARGIN;
+    sx.strokeStyle='rgba(220,235,255,'+(s.a*heavy).toFixed(3)+')';
+    sx.lineWidth=rand(.7,2);
+    sx.beginPath(); sx.moveTo(s.x,s.y); sx.lineTo(s.x+slant*s.len,s.y+s.len); sx.stroke();
+  }
+}
+const sill = () => Math.max(40, Math.min(110, H*.07));
+
+/* ----------------------------------------------------------------- render */
+function bead(d){
+  const R=d.r; if(R<.4) return;
+  const stretch=d.moving ? 1+Math.min(d.vy/1300,1.05) : 1;
+  const ry=R*stretch, bright=PAL[sceneName].luma>.5;
+  const rimA=bright?.50:.34, specA=bright?.72:1;
+  if(R<1.9){
+    ctx.beginPath(); ctx.arc(d.x,d.y,R,0,TAU);
+    ctx.fillStyle=bright?'rgba(40,60,90,.20)':'rgba(215,235,255,.22)'; ctx.fill();
+    ctx.beginPath(); ctx.arc(d.x,d.y,R,0,TAU);
+    ctx.strokeStyle=bright?'rgba(255,255,255,.35)':'rgba(255,255,255,.30)'; ctx.lineWidth=.9; ctx.stroke();
+    ctx.beginPath(); ctx.arc(d.x-R*.3,d.y-R*.34,Math.max(.3,R*.34),0,TAU);
+    ctx.fillStyle='rgba(255,255,255,'+(.9*specA).toFixed(3)+')'; ctx.fill();
+    return;
+  }
+  const zoom=.78+(d.phase%1)*.16;
+  const sw=Math.min(W,R*2*zoom), sh=Math.min(H,ry*2*zoom);
+  const sx=clamp(d.x-sw/2,0,W-sw), sy=clamp(d.y-sh/2,0,H-sh);
+  ctx.save();
+  ctx.beginPath(); ctx.ellipse(d.x,d.y,R,ry,0,0,TAU); ctx.clip();
+  ctx.translate(d.x,d.y); ctx.scale(-1,-1);
+  ctx.drawImage(bg.c, sx*DPR, sy*DPR, sw*DPR, sh*DPR, -R, -ry, R*2, ry*2);
+  ctx.setTransform(DPR,0,0,DPR,0,0);
+  const rg=ctx.createRadialGradient(d.x,d.y,R*.18,d.x,d.y,R);
+  rg.addColorStop(0,'rgba(0,0,0,0)'); rg.addColorStop(.68,'rgba(0,0,0,0.05)');
+  rg.addColorStop(.94,'rgba(0,0,0,'+(rimA*.6).toFixed(3)+')'); rg.addColorStop(1,'rgba(0,0,0,'+rimA.toFixed(3)+')');
+  ctx.fillStyle=rg; ctx.fillRect(d.x-R-1,d.y-ry-1,R*2+2,ry*2+2);
+  const cg=ctx.createRadialGradient(d.x,d.y+ry*.4,0,d.x,d.y+ry*.4,R*.98);
+  cg.addColorStop(0,'rgba(255,255,255,'+(.20+(bright?.10:.06)).toFixed(3)+')');
+  cg.addColorStop(.6,'rgba(255,255,255,.06)'); cg.addColorStop(1,'rgba(255,255,255,0)');
+  ctx.fillStyle=cg; ctx.fillRect(d.x-R-1,d.y-ry-1,R*2+2,ry*2+2);
+  const eg=ctx.createRadialGradient(d.x+R*.42,d.y+ry*.52,0,d.x+R*.42,d.y+ry*.52,R*.62);
+  eg.addColorStop(0,'rgba(255,255,255,'+(.30*specA).toFixed(3)+')'); eg.addColorStop(1,'rgba(255,255,255,0)');
+  ctx.fillStyle=eg; ctx.fillRect(d.x-R-1,d.y-ry-1,R*2+2,ry*2+2);
+  const hg=ctx.createRadialGradient(d.x-R*.34,d.y-ry*.46,0,d.x-R*.34,d.y-ry*.46,R*.55);
+  hg.addColorStop(0,'rgba(255,255,255,'+specA.toFixed(3)+')');
+  hg.addColorStop(.3,'rgba(255,255,255,'+(.40*specA).toFixed(3)+')'); hg.addColorStop(1,'rgba(255,255,255,0)');
+  ctx.fillStyle=hg; ctx.fillRect(d.x-R-1,d.y-ry-1,R*2+2,ry*2+2);
+  ctx.restore();
+  ctx.beginPath(); ctx.ellipse(d.x,d.y,R*1.16,ry*1.14,0,0,TAU);
+  ctx.strokeStyle=bright?'rgba(255,255,255,.22)':'rgba(180,215,255,.18)'; ctx.lineWidth=1.1; ctx.stroke();
+}
+function render(){
+  bg.x.setTransform(DPR,0,0,DPR,0,0);
+  bg.x.clearRect(0,0,W,H);
+  const ox=(MARGIN/2+camX)*DPR;
+  bg.x.filter='brightness('+(P.exposure*(1+boost*1.4)).toFixed(3)+')';
+  bg.x.drawImage(pA.c, ox,0,W*DPR,H*DPR, 0,0,W,H);
+  bg.x.filter='none';
+  if(fading){
+    bg.x.globalAlpha=fade;
+    bg.x.drawImage(pB.c, ox,0,W*DPR,H*DPR, 0,0,W,H);
+    bg.x.globalAlpha=1;
+  }
+  if(P.storm){ bg.x.fillStyle='rgba(24,34,52,0.34)'; bg.x.fillRect(0,0,W,H); }
+  bg.x.filter='blur(2px)'; bg.x.drawImage(st.c,0,0,W,H); bg.x.filter='none';
+
+  ctx.setTransform(DPR,0,0,DPR,0,0);
+  ctx.drawImage(bg.c,0,0,W,H);
+
+  if(flash>.001){
+    const a=flash*flash*.55;
+    const lg=ctx.createLinearGradient(0,0,W*.7,H);
+    lg.addColorStop(0,'rgba(200,220,255,'+(a*.7).toFixed(3)+')');
+    lg.addColorStop(1,'rgba(160,190,240,0)');
+    ctx.fillStyle=lg; ctx.fillRect(0,0,W,H);
+  }
+  const sh=sill();
+  const pg=ctx.createLinearGradient(0,H-sh,0,H);
+  pg.addColorStop(0,'rgba(22,36,58,0)'); pg.addColorStop(.3,'rgba(18,30,50,.42)'); pg.addColorStop(1,'rgba(9,15,28,.80)');
+  ctx.fillStyle=pg; ctx.fillRect(0,H-sh,W,sh);
+  ctx.beginPath();
+  for(let x=0;x<=W;x+=8){
+    const y=H-sh+Math.sin(x*.045+T*1.8)*1.6+Math.sin(x*.011-T*.9)*1.1;
+    if(x===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+  }
+  ctx.strokeStyle='rgba(200,225,255,.22)'; ctx.lineWidth=1.2; ctx.stroke();
+  for(const r of ripples){
+    const rx=r.max*r.t;
+    ctx.beginPath(); ctx.ellipse(r.x,H-sh+2,rx,Math.max(1.4,rx*.16),0,0,TAU);
+    ctx.strokeStyle='rgba(205,230,255,'+(.34*(1-r.t)).toFixed(3)+')'; ctx.lineWidth=1.6; ctx.stroke();
+  }
+  for(const r of residue){
+    ctx.beginPath(); ctx.arc(r.x,r.y,r.r,0,TAU); ctx.fillStyle='rgba(190,215,248,.16)'; ctx.fill();
+    ctx.beginPath(); ctx.arc(r.x-r.r*.3,r.y-r.r*.34,Math.max(.24,r.r*.3),0,TAU);
+    ctx.fillStyle='rgba(255,255,255,.6)'; ctx.fill();
+  }
+  for(const d of drops) bead(d);
+  for(const b of bolts) boltPath(b);
+}
+
+/* ------------------------------------------------------------------ setup */
+function resize(){
+  DPR=Math.min(window.devicePixelRatio||1,2);
+  W=innerWidth; H=innerHeight; SW=W+MARGIN*2;
+  // the main canvas is a plain DOM element, not a {c,x} wrapper
+  cv.width=Math.floor(W*DPR); cv.height=Math.floor(H*DPR);
+  const set=(o,w)=>{ o.c.width=Math.floor((w||W)*DPR); o.c.height=Math.floor(H*DPR); o.x.setTransform(DPR,0,0,DPR,0,0); };
+  set(bg); set(st); set(sc,SW); set(pA,SW); set(pB,SW);
+  ctx.setTransform(DPR,0,0,DPR,0,0);
+  plate(pA); plate(pB); copyPlate();
+}
+addEventListener('resize',()=>{ clearTimeout(resize._t); resize._t=setTimeout(resize,160); });
+resize();
+for(let i=0;i<120;i++) spawn();
+if(P.thunder||P.rainSnd){ audio(); if(P.rainSnd) startBed(); }
+
+/* report input to the desktop wrapper when it is present */
+if(window.desktopAPI && window.desktopAPI.notifyInput){
+  const api=window.desktopAPI; let lm=0;
+  addEventListener('keydown',()=>api.notifyInput('key'));
+  addEventListener('wheel',()=>api.notifyInput('wheel'));
+  addEventListener('pointerdown',()=>api.notifyInput('click'));
+  addEventListener('pointermove',()=>{ const n=performance.now(); if(n-lm>140){ lm=n; api.notifyInput('move'); } });
+}
+addEventListener('keydown',e=>{
+  if(e.key==='f'||e.key==='F'){ document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen?.(); }
+  if(e.key===' '){ e.preventDefault(); paused=!paused; }
+});
+addEventListener('pointerdown',()=>{ if(ac&&ac.state==='suspended') ac.resume(); }, {once:true});
+
+/* --------------------------------------------------------------- run loop */
+let fc=0, fs=performance.now();
+function frame(now){
+  const dt=Math.min(.05,(now-last)/1000); last=now;
+  if(!paused) update(dt);
+  render();
+  fc++;
+  if(now-fs>2000){
+    const fps=fc/((now-fs)/1000);
+    if(fps<38) quality=Math.max(.45,quality-.12);      // back off on slow hardware
+    fs=now; fc=0;
+  }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
+
+							<script>
+                            	
+							</script>
+                        </body>
+                        </html>
+                    
